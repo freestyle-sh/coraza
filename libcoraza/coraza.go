@@ -35,7 +35,7 @@ import (
 	"unsafe"
 
 	"github.com/corazawaf/coraza/v3"
-	"github.com/corazawaf/coraza/v3/internal/corazawaf"
+	"github.com/corazawaf/coraza/v3/internal/corazarules"
 	"github.com/corazawaf/coraza/v3/types"
 )
 
@@ -335,11 +335,18 @@ func coraza_get_matched_logmsg(t C.coraza_transaction_t) *C.char {
 	var err error
 	message := make([]MessageData, 0)
 	for _, mr := range tx.MatchedRules() {
-		r := mr.Rule().(*corazawaf.Rule)
-		if !r.Log && !r.Audit {
-			// 说明被匹配到的规则是nolog类型，不需要返回给调用人员
+		// Type assert to access Log() method (not in types.MatchedRule interface)
+		matchedRule, ok := mr.(*corazarules.MatchedRule)
+		if !ok {
 			continue
 		}
+		// Skip nolog rules - check Log() and AuditLog() as proxy for Audit flag
+		if !matchedRule.Log() && matchedRule.AuditLog() == "" {
+			continue
+		}
+
+		// Get rule metadata through the interface
+		r := mr.Rule()
 
 		matchData := make([]string, 0, 10)
 		for _, i := range mr.MatchedDatas() {
