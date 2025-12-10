@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //go:build !tinygo
-// +build !tinygo
 
 package auditlog
 
@@ -55,6 +54,15 @@ func (cl concurrentWriter) Write(al plugintypes.AuditLog) error {
 		return nil
 	}
 
+	formattedAL, err := cl.formatter.Format(al)
+	if err != nil {
+		return err
+	}
+
+	if len(formattedAL) == 0 {
+		return nil
+	}
+
 	// 192.168.3.130 192.168.3.1 - - [22/Aug/2009:13:24:20 +0100] "GET / HTTP/1.1" 200 56 "-" "-" SojdH8AAQEAAAugAQAAAAAA "-" /20090822/20090822-1324/20090822-132420-SojdH8AAQEAAAugAQAAAAAA 0 1248
 	t := time.Unix(0, al.Transaction().UnixTimestamp())
 
@@ -64,11 +72,6 @@ func (cl concurrentWriter) Write(al plugintypes.AuditLog) error {
 
 	logdir := path.Join(cl.logDir, ymd, ymdhm)
 	if err := os.MkdirAll(logdir, cl.logDirMode); err != nil {
-		return err
-	}
-
-	formattedAL, err := cl.formatter(al)
-	if err != nil {
 		return err
 	}
 

@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //go:build tinygo
-// +build tinygo
 
 package auditlog
 
@@ -13,14 +12,17 @@ func init() {
 		return noopWriter{}
 	})
 	RegisterWriter("serial", func() plugintypes.AuditLogWriter {
-		return noopWriter{}
+		return &serialWriter{}
 	})
 	RegisterWriter("https", func() plugintypes.AuditLogWriter {
 		return noopWriter{}
 	})
+	RegisterWriter("syslog", func() plugintypes.AuditLogWriter {
+		return noopWriter{}
+	})
 
-	// TODO(jcchavezs): check if newest TinyGo supports json.Marshaler for audit log type.
-	RegisterFormatter("json", noopFormater)
-	RegisterFormatter("jsonlegacy", noopFormater)
-	RegisterFormatter("native", nativeFormatter)
+	RegisterFormatter("json", &jsonFormatter{})
+	RegisterFormatter("jsonlegacy", &legacyJSONFormatter{})
+	RegisterFormatter("native", &nativeFormatter{})
+	RegisterFormatter("ocsf", &ocsfFormatter{})
 }

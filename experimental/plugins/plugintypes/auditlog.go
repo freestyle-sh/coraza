@@ -1,4 +1,4 @@
-// Copyright 2023 Juan Pablo Tosso and the OWASP Coraza contributors
+// Copyright 2024 Juan Pablo Tosso and the OWASP Coraza contributors
 // SPDX-License-Identifier: Apache-2.0
 
 package plugintypes
@@ -6,6 +6,7 @@ package plugintypes
 import (
 	"io/fs"
 
+	"github.com/corazawaf/coraza/v3/internal/collections"
 	"github.com/corazawaf/coraza/v3/types"
 )
 
@@ -31,6 +32,8 @@ type AuditLogTransaction interface {
 	Response() AuditLogTransactionResponse
 	HasResponse() bool
 	Producer() AuditLogTransactionProducer
+	HighestSeverity() string // The highest severity of the matched rules for the transaction
+	IsInterrupted() bool     // True if the transaction was interrupted
 }
 
 // AuditLogTransactionResponse contains response specific information
@@ -61,6 +64,8 @@ type AuditLogTransactionRequest interface {
 	Headers() map[string][]string
 	Body() string
 	Files() []AuditLogTransactionRequestFiles
+	Args() *collections.ConcatKeyed // A string representation of all request arguments in the format 'k=v,'
+	Length() int32                  // The total size of the request in bytes
 }
 
 // AuditLogTransactionRequestFiles contains information for the
@@ -76,6 +81,7 @@ type AuditLogMessage interface {
 	Actionset() string
 	Message() string
 	Data() AuditLogMessageData
+	// TODO(4.x): Add Log() ErrorMessage() string
 }
 
 // AuditLogMessageData contains information about the triggered rules
@@ -128,5 +134,9 @@ type AuditLogWriter interface {
 	Close() error
 }
 
-// AuditLogFormatter formats an audit log to a byte slice.
-type AuditLogFormatter func(AuditLog) ([]byte, error)
+// AuditLogFormatter serializes an AuditLog into a byte slice.
+// It is used to construct the formatted audit log.
+type AuditLogFormatter interface {
+	Format(AuditLog) ([]byte, error)
+	MIME() string
+}

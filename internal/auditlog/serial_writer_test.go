@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //go:build !tinygo
-// +build !tinygo
 
 package auditlog
 
@@ -61,7 +60,7 @@ func TestSerialWriterFailsOnInitForUnexistingFile(t *testing.T) {
 	config.Dir = t.TempDir()
 	config.FileMode = fs.FileMode(0777)
 	config.DirMode = fs.FileMode(0777)
-	config.Formatter = jsonFormatter
+	config.Formatter = &jsonFormatter{}
 
 	w := &serialWriter{}
 	if err := w.Init(config); err == nil {
@@ -78,7 +77,7 @@ func TestSerialWriterWrites(t *testing.T) {
 	writer := &serialWriter{}
 	config := NewConfig()
 	config.Target = tmp
-	config.Formatter = jsonFormatter
+	config.Formatter = &jsonFormatter{}
 
 	if err := writer.Init(config); err != nil {
 		t.Fatal(err)

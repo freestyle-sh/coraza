@@ -15,7 +15,7 @@ func TestNewTransaction(t *testing.T) {
 	waf.ResponseBodyAccess = true
 	waf.RequestBodyLimit = 1044
 
-	tx := waf.NewTransactionWithID("test")
+	tx := waf.NewTransactionWithOptions(Options{ID: "test"})
 	if !tx.RequestBodyAccess {
 		t.Error("Request body access not enabled")
 	}
@@ -28,7 +28,7 @@ func TestNewTransaction(t *testing.T) {
 	if tx.id != "test" {
 		t.Error("ID not set")
 	}
-	tx = waf.NewTransactionWithID("")
+	tx = waf.NewTransactionWithOptions(Options{ID: ""})
 	if tx.id == "" {
 		t.Error("ID not set")
 	}
@@ -75,9 +75,9 @@ func TestValidate(t *testing.T) {
 			expectErr:  true,
 			customizer: func(w *WAF) { w.RequestBodyLimit = -1 },
 		},
-		"request body limit greater than 1gb": {
+		"request body limit greater than 1gib": {
 			expectErr:  true,
-			customizer: func(w *WAF) { w.RequestBodyLimit = _1gb + 1 },
+			customizer: func(w *WAF) { w.RequestBodyLimit = _1gib + 1 },
 		},
 		"request body in memory limit less than zero": {
 			expectErr:  true,
@@ -93,9 +93,9 @@ func TestValidate(t *testing.T) {
 			expectErr:  true,
 			customizer: func(w *WAF) { w.ResponseBodyLimit = -1 },
 		},
-		"response body limit greater than 1gb": {
+		"response body limit greater than 1gib": {
 			expectErr:  true,
-			customizer: func(w *WAF) { w.ResponseBodyLimit = _1gb + 1 },
+			customizer: func(w *WAF) { w.ResponseBodyLimit = _1gib + 1 },
 		},
 		"argument limit greater than 0": {
 			expectErr:  false,

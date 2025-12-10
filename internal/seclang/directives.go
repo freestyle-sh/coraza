@@ -16,6 +16,8 @@ import (
 	"github.com/corazawaf/coraza/v3/debuglog"
 	"github.com/corazawaf/coraza/v3/internal/auditlog"
 	"github.com/corazawaf/coraza/v3/internal/corazawaf"
+	"github.com/corazawaf/coraza/v3/internal/environment"
+	"github.com/corazawaf/coraza/v3/internal/memoize"
 	utils "github.com/corazawaf/coraza/v3/internal/strings"
 	"github.com/corazawaf/coraza/v3/types"
 )
@@ -59,6 +61,15 @@ var _ directive = directiveInclude
 
 var errEmptyOptions = errors.New("expected options")
 
+// Description: Appends component signature to the Coraza signature.
+// Syntax: SecComponentSignature "COMPONENT_NAME/X.Y.Z (COMMENT)"
+// ---
+// Appends component signature to the Coraza signature.
+//
+// Example:
+// ```apache
+// SecComponentSignature "OWASP_CRS/4.18.0"
+// ```
 func directiveSecComponentSignature(options *DirectiveOptions) error {
 	if len(options.Opts) == 0 {
 		return errEmptyOptions
@@ -108,6 +119,7 @@ func directiveSecMarker(options *DirectiveOptions) error {
 	rule.Raw_ = fmt.Sprintf("SecMarker %s", options.Opts)
 	rule.SecMark_ = options.Opts
 	rule.ID_ = 0
+	rule.LogID_ = "0"
 	rule.Phase_ = 0
 	rule.Line_ = options.Parser.LastLine
 	rule.File_ = options.Parser.ConfigFile
@@ -228,11 +240,13 @@ func directiveSecResponseBodyAccess(options *DirectiveOptions) error {
 }
 
 // Description: Configures the maximum request body size Coraza will accept for buffering.
-// Default: 134217728 (131072 KB)
+// Default: 134217728 (128 Mib)
 // Syntax: SecRequestBodyLimit [LIMIT_IN_BYTES]
 // ---
-// Anything over the limit will be rejected with status code 413 (Request Entity Too Large).
-// There is a hard limit of 1 GB.
+// Depends on `SecRequestBodyLimitAction`
+// - Reject: Anything over this limit will be rejected with status code 413 (Request Entity Too Large).
+// - ProcessPartial: The first N bytes of the request body will be processed.
+// There is a hard limit of 1 GiB.
 func directiveSecRequestBodyLimit(options *DirectiveOptions) error {
 	if len(options.Opts) == 0 {
 		return errEmptyOptions
@@ -305,6 +319,19 @@ func directiveSecServerSignature(options *DirectiveOptions) error {
 	return nil
 }
 
+// Description: Removes the matching rules from the current configuration context.
+// Syntax: SecRuleRemoveByTag [TAG]
+// ---
+// Normally, you would use `SecRuleRemoveById` to remove rules, but it may occasionally
+// be easier to disable an entire group of rules with `SecRuleRemoveByTag`. Matching is
+// by case-sensitive string equality.
+//
+// Example:
+// ```apache
+// SecRuleRemoveByTag attack-dos
+// ```
+//
+// Note: OWASP CRS has a list of supported tags https://coreruleset.org/docs/rules/metadata/
 func directiveSecRuleRemoveByTag(options *DirectiveOptions) error {
 	if len(options.Opts) == 0 {
 		return errEmptyOptions
@@ -314,6 +341,17 @@ func directiveSecRuleRemoveByTag(options *DirectiveOptions) error {
 	return nil
 }
 
+// Description: Removes the matching rules from the current configuration context.
+// Syntax: SecRuleRemoveByMsg MESSAGE
+// ---
+// Normally, you would use `SecRuleRemoveById` to remove rules, but it may occasionally
+// be easier to disable one or more rules with `SecRuleRemoveByMsg`. Matching is
+// by case-sensitive string equality.
+//
+// Example:
+// ```apache
+// SecRuleRemoveByMsg "Directory Listing"
+// ```
 func directiveSecRuleRemoveByMsg(options *DirectiveOptions) error {
 	if len(options.Opts) == 0 {
 		return errEmptyOptions
@@ -340,6 +378,9 @@ func directiveSecRuleRemoveByID(options *DirectiveOptions) error {
 
 			options.WAF.Rules.DeleteByID(id)
 		} else {
+			if idx == 0 {
+				return fmt.Errorf("SecRuleRemoveById: invalid negative id: %s", idOrRange)
+			}
 			start, err := strconv.Atoi(idOrRange[:idx])
 			if err != nil {
 				return err
@@ -361,6 +402,9 @@ func directiveSecRuleRemoveByID(options *DirectiveOptions) error {
 	return nil
 }
 
+// Description: Clears the list of MIME types considered for response body buffering,
+// allowing you to start populating the list from scratch.
+// Syntax: SecResponseBodyMimeTypesClear
 func directiveSecResponseBodyMimeTypesClear(options *DirectiveOptions) error {
 	if len(options.Opts) > 0 {
 		return errors.New("unexpected options")
@@ -369,6 +413,16 @@ func directiveSecResponseBodyMimeTypesClear(options *DirectiveOptions) error {
 	return nil
 }
 
+// Description: Configures which MIME types are to be considered for response body buffering.
+// Syntax: SecResponseBodyMimeType MIMETYPE MIMETYPE ...
+// ---
+// Multiple SecResponseBodyMimeType directives can be used to add MIME types.
+// Use SecResponseBodyMimeTypesClear to clear previously configured MIME types and start over.
+//
+// Example:
+// ```apache
+// SecResponseBodyMimeType text/plain text/html text/xml
+// ```
 func directiveSecResponseBodyMimeType(options *DirectiveOptions) error {
 	if len(options.Opts) == 0 {
 		return errEmptyOptions
@@ -409,11 +463,13 @@ func directiveSecResponseBodyLimitAction(options *DirectiveOptions) error {
 
 // Description: Configures the maximum response body size that will be accepted for buffering.
 // Syntax: SecResponseBodyLimit [LIMIT_IN_BYTES]
-// Default: 524288 (512 KB)
+// Default: 524288 (512 Kib)
 // ---
-// Anything over this limit will be rejected with status code 500 (Internal Server Error).
+// Depends on `SecResponseBodyLimitAction`
+// - Reject: Anything over this limit will be rejected with status code 500 (Internal Server Error).
+// - ProcessPartial: The first N bytes of the response body will be processed.
 // This setting will not affect the responses with MIME types that are not selected for
-// buffering. There is a hard limit of 1 GB.
+// buffering. There is a hard limit of 1 GiB.
 func directiveSecResponseBodyLimit(options *DirectiveOptions) error {
 	if len(options.Opts) == 0 {
 		return errEmptyOptions
@@ -447,7 +503,7 @@ func directiveSecRequestBodyLimitAction(options *DirectiveOptions) error {
 }
 
 // Description: Configures the maximum request body size that Coraza will store in memory.
-// Default: 131072 (128 KB)
+// Default: defaults to RequestBodyLimit
 // Syntax: SecRequestBodyInMemoryLimit [LIMIT_IN_BYTES]
 // ---
 // When a `multipart/form-data` request is being processed, once the in-memory limit is reached,
@@ -592,8 +648,6 @@ func directiveSecCollectionTimeout(options *DirectiveOptions) error {
 // or the concurrent logging index file (concurrent logging format).
 // Syntax: SecAuditLog [ABSOLUTE_PATH_TO_LOG_FILE]
 // ---
-// When used in combination with mlogc (only possible with concurrent logging), this
-// directive defines the mlogc location and command line.
 //
 // Example:
 // ```apache
@@ -613,6 +667,24 @@ func directiveSecAuditLog(options *DirectiveOptions) error {
 	return nil
 }
 
+// Description: Configures the type of audit logging mechanism to be used.
+// Syntax: SecAuditLogType Serial|Concurrent|HTTPS|Syslog
+// ---
+// The possible values are:
+//
+//   - Serial : Audit log entries will be stored in a single file, specified by SecAuditLog.
+//     This is convenient for casual use, but it can slow down the server, because only
+//     one audit log entry can be written to the file at any one time.
+//   - Concurrent : One file per transaction is used for audit logging. This approach is more
+//     scalable when heavy logging is required (multiple transactions can be recorded in parallel)
+//   - HTTPS : Audit log entries will be sent to the target URL, specified by SecAuditLog.
+//   - Syslog : Audit log entries will be sent to the syslog server, specified by SecAuditLog
+//     in one of formats: "ADDRESS:PORT" (TCP), "udp://ADDRESS:PORT", or "unixgram:///var/run/syslog".
+//
+// Example:
+// ```apache
+// SecAuditLogType Serial
+// ```
 func directiveSecAuditLogType(options *DirectiveOptions) error {
 	if len(options.Opts) == 0 {
 		return errEmptyOptions
@@ -627,9 +699,9 @@ func directiveSecAuditLogType(options *DirectiveOptions) error {
 	return nil
 }
 
-// Description: Select the output format of the AuditLogs. The format can be either
-// the native AuditLogs format or JSON.
-// Syntax: SecAuditLogFormat JSON|Native
+// Description: Select the output format of the AuditLogs. The format can be
+// the native AuditLogs format, JSON, or OCSF (Open CyberSecurity Schema Framework).
+// Syntax: SecAuditLogFormat JSON|JsonLegacy|Native|OCSF
 // Default: Native
 func directiveSecAuditLogFormat(options *DirectiveOptions) error {
 	if len(options.Opts) == 0 {
@@ -645,6 +717,16 @@ func directiveSecAuditLogFormat(options *DirectiveOptions) error {
 	return nil
 }
 
+// Description: Configures the directory where concurrent audit log entries are stored.
+// Syntax: SecAuditLogDir [PATH_TO_LOG_DIR]
+// ---
+// This directive is required only when concurrent audit logging is used. Ensure that you
+// specify a file system location with adequate disk space.
+//
+// Example:
+// ```apache
+// SecAuditLogDir /tmp/auditlogs/
+// ```
 func directiveSecAuditLogDir(options *DirectiveOptions) error {
 	if len(options.Opts) == 0 {
 		return errEmptyOptions
@@ -656,7 +738,7 @@ func directiveSecAuditLogDir(options *DirectiveOptions) error {
 }
 
 // Description: Configures the mode (permissions) of any directories created for the
-// concurrent audit logs, using an octal mode value as parameter (as used in chmod).
+// concurrent audit logs, using an octal mode value as parameter (as used in `chmod`).
 // Syntax: SecAuditLogDirMode octal_mode|"default"
 // Default: 0600
 // ---
@@ -731,9 +813,13 @@ func directiveSecAuditLogRelevantStatus(options *DirectiveOptions) error {
 		return errEmptyOptions
 	}
 
-	var err error
-	options.WAF.AuditLogRelevantStatus, err = regexp.Compile(options.Opts)
-	return err
+	re, err := memoize.Do(options.Opts, func() (any, error) { return regexp.Compile(options.Opts) })
+	if err != nil {
+		return err
+	}
+
+	options.WAF.AuditLogRelevantStatus = re.(*regexp.Regexp)
+	return nil
 }
 
 // Description: Defines which parts of each transaction are going to be recorded
@@ -743,9 +829,6 @@ func directiveSecAuditLogRelevantStatus(options *DirectiveOptions) error {
 // Syntax: SecAuditLogParts [PARTLETTERS]
 // Default: ABCFHZ
 // ---
-// The format of the audit log format is documented in detail in the Audit Log Data
-// Format Documentation.
-//
 // Example:
 // ```apache
 // SecAuditLogParts ABCFHZ
@@ -807,7 +890,7 @@ func directiveSecAuditLogParts(options *DirectiveOptions) error {
 // SecAuditLog logs/audit/audit.log
 // SecAuditLogParts ABCFHZ
 // SecAuditLogType concurrent
-// SecAuditLogStorageDir logs/audit
+// SecAuditLogDir logs/audit
 // SecAuditLogRelevantStatus ^(?:5|4(?!04))
 // ```
 func directiveSecAuditEngine(options *DirectiveOptions) error {
@@ -866,7 +949,13 @@ func directiveSecUploadDir(options *DirectiveOptions) error {
 		return errEmptyOptions
 	}
 
-	// TODO validations
+	if environment.HasAccessToFS {
+		if err := environment.IsDirWritable(options.Opts); err != nil {
+			return fmt.Errorf("filesystem access check: %w. Check SecUploadDir provided dir: %s", err, options.Opts)
+		}
+	} else {
+		return fmt.Errorf("SecUploadDir directive is not effective because of no access to the filesystem")
+	}
 	options.WAF.UploadDir = options.Opts
 	return nil
 }
@@ -884,7 +973,8 @@ func directiveSecUploadDir(options *DirectiveOptions) error {
 // ---
 // Generally speaking, the default value is not small enough. For most applications, you
 // should be able to reduce it down to 128 KB or lower. Anything over the limit will be
-// rejected with status code 413 (Request Entity Too Large). There is a hard limit of 1 GB.
+// rejected with status code 413 (Request Entity Too Large). There is a hard limit of 1 GiB.
+// Note: not implemented yet
 func directiveSecRequestBodyNoFilesLimit(options *DirectiveOptions) error {
 	if len(options.Opts) == 0 {
 		return errEmptyOptions
@@ -933,22 +1023,203 @@ func directiveSecDebugLogLevel(options *DirectiveOptions) error {
 	return options.WAF.SetDebugLogLevel(debuglog.Level(lvl))
 }
 
+// Description: Updates the target (variable) list of the specified rule(s).
+// Syntax: SecRuleUpdateTargetById ID TARGET1[|TARGET2|TARGET3]
+// ---
+// This directive will append variables to the specified rule with the targets provided in the second parameter.
+// The rule ID can be single IDs or ranges of IDs. The targets are separated by a pipe character.
 func directiveSecRuleUpdateTargetByID(options *DirectiveOptions) error {
-	idStr, v, ok := strings.Cut(options.Opts, " ")
-	if !ok {
+	if len(options.Opts) == 0 {
+		return errEmptyOptions
+	}
+
+	idsOrRanges := strings.Fields(options.Opts)
+	length := len(idsOrRanges)
+	if length < 2 {
 		return errors.New("syntax error: SecRuleUpdateTargetById id \"VARIABLES\"")
 	}
-	id, err := strconv.Atoi(idStr)
-	if err != nil {
-		return err
+	// The last element is expected to be the variable(s)
+	variables := idsOrRanges[length-1]
+	for _, idOrRange := range idsOrRanges[:length-1] {
+		if idx := strings.Index(idOrRange, "-"); idx == -1 {
+			id, err := strconv.Atoi(idOrRange)
+			if err != nil {
+				return err
+			}
+			return updateTargetBySingleID(id, variables, options)
+		} else {
+			if idx == 0 {
+				return fmt.Errorf("SecRuleUpdateTargetById: invalid negative id: %s", idOrRange)
+			}
+			start, err := strconv.Atoi(idOrRange[:idx])
+			if err != nil {
+				return err
+			}
+
+			end, err := strconv.Atoi(idOrRange[idx+1:])
+			if err != nil {
+				return err
+			}
+			if start == end {
+				return updateTargetBySingleID(start, variables, options)
+			}
+			if start > end {
+				return fmt.Errorf("invalid range: %s", idOrRange)
+			}
+
+			for _, rule := range options.WAF.Rules.GetRules() {
+				if rule.ID_ >= start && rule.ID_ <= end {
+					rp := RuleParser{
+						rule: &rule,
+						options: RuleOptions{
+							WAF: options.WAF,
+						},
+						defaultActions: map[types.RulePhase][]ruleAction{},
+					}
+					if err := rp.ParseVariables(strings.Trim(variables, "\"")); err != nil {
+						return err
+					}
+				}
+			}
+		}
 	}
+	return nil
+}
+
+func updateTargetBySingleID(id int, variables string, options *DirectiveOptions) error {
+
 	rule := options.WAF.Rules.FindByID(id)
+	if rule == nil {
+		return fmt.Errorf("SecRuleUpdateTargetById: rule \"%d\" not found", id)
+	}
 	rp := RuleParser{
-		rule:           rule,
-		options:        RuleOptions{},
+		rule: rule,
+		options: RuleOptions{
+			WAF: options.WAF,
+		},
 		defaultActions: map[types.RulePhase][]ruleAction{},
 	}
-	return rp.ParseVariables(strings.Trim(v, "\""))
+	return rp.ParseVariables(strings.Trim(variables, "\""))
+}
+
+// Description: Updates the action list of the specified rule(s).
+// Syntax: SecRuleUpdateActionById ID ACTIONLIST
+// ---
+// This directive will overwrite the action list of the specified rule with the actions provided in the second parameter.
+// It has two limitations: it cannot be used to change the ID or phase of a rule.
+// Only the actions that can appear only once are overwritten.
+// The actions that are allowed to appear multiple times in a list, will be appended to the end of the list.
+// The following example demonstrates how `SecRuleUpdateActionById` is used:
+// ```apache
+// SecRuleUpdateActionById 12345 "deny,status:403"
+// ```
+func directiveSecRuleUpdateActionByID(options *DirectiveOptions) error {
+	if len(options.Opts) == 0 {
+		return errEmptyOptions
+	}
+
+	idsOrRanges := strings.Fields(options.Opts)
+	idsOrRangesLen := len(idsOrRanges)
+	if idsOrRangesLen < 2 {
+		return errors.New("syntax error: SecRuleUpdateActionById id \"ACTION1,ACTION2,...\"")
+	}
+	// The last element is expected to be the action(s)
+	actions := idsOrRanges[idsOrRangesLen-1]
+	for _, idOrRange := range idsOrRanges[:idsOrRangesLen-1] {
+		if idx := strings.Index(idOrRange, "-"); idx == -1 {
+			id, err := strconv.Atoi(idOrRange)
+			if err != nil {
+				return err
+			}
+			return updateActionBySingleID(id, actions, options)
+		} else {
+			if idx == 0 {
+				return fmt.Errorf("SecRuleUpdateActionById: invalid negative id: %s", idOrRange)
+			}
+			start, err := strconv.Atoi(idOrRange[:idx])
+			if err != nil {
+				return err
+			}
+
+			end, err := strconv.Atoi(idOrRange[idx+1:])
+			if err != nil {
+				return err
+			}
+			if start == end {
+				return updateActionBySingleID(start, actions, options)
+			}
+			if start > end {
+				return fmt.Errorf("invalid range: %s", idOrRange)
+			}
+
+			for _, rule := range options.WAF.Rules.GetRules() {
+				if rule.ID_ < start && rule.ID_ > end {
+					continue
+				}
+				rp := RuleParser{
+					rule: &rule,
+					options: RuleOptions{
+						WAF: options.WAF,
+					},
+					defaultActions: map[types.RulePhase][]ruleAction{},
+				}
+				if err := rp.ParseActions(strings.Trim(actions, "\"")); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func updateActionBySingleID(id int, actions string, options *DirectiveOptions) error {
+
+	rule := options.WAF.Rules.FindByID(id)
+	if rule == nil {
+		return fmt.Errorf("SecRuleUpdateActionById: rule \"%d\" not found", id)
+	}
+	rp := RuleParser{
+		rule: rule,
+		options: RuleOptions{
+			WAF: options.WAF,
+		},
+		defaultActions: map[types.RulePhase][]ruleAction{},
+	}
+	return rp.ParseActions(strings.Trim(actions, "\""))
+}
+
+// Description: Updates the target (variable) list of the specified rule(s) by tag.
+// Syntax: SecRuleUpdateTargetByTag TAG TARGET1[|TARGET2|TARGET3]
+// ---
+// As an alternative to `SecRuleUpdateTargetById`, this directive will append variables to the specified rule
+// with the targets provided in the second parameter. It can be handy for updating an entire group of rules.
+// Matching is by case-sensitive string equality.
+// This directive will append variables to the specified rule with the targets provided in the second parameter.
+// The rule ID can be single IDs or ranges of IDs. The targets are separated by a pipe character.
+// Note: OWASP CRS has a list of supported tags https://coreruleset.org/docs/rules/metadata/
+func directiveSecRuleUpdateTargetByTag(options *DirectiveOptions) error {
+	tagAndvars := strings.Fields(options.Opts)
+	if len(tagAndvars) != 2 {
+		return errors.New("syntax error: SecRuleUpdateTargetByTag tag \"VARIABLES\"")
+	}
+
+	for _, rule := range options.WAF.Rules.GetRules() {
+		inputTag := strings.Trim(tagAndvars[0], "\"")
+		if utils.InSlice(inputTag, rule.Tags_) {
+			rp := RuleParser{
+				rule: &rule,
+				options: RuleOptions{
+					WAF: options.WAF,
+				},
+				defaultActions: map[types.RulePhase][]ruleAction{},
+			}
+			inputVars := strings.Trim(tagAndvars[1], "\"")
+			if err := rp.ParseVariables(inputVars); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func directiveSecIgnoreRuleCompilationErrors(options *DirectiveOptions) error {

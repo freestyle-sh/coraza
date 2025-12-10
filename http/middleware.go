@@ -3,7 +3,6 @@
 
 // tinygo does not support net.http so this package is not needed for it
 //go:build !tinygo
-// +build !tinygo
 
 package http
 
@@ -15,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/corazawaf/coraza/v3"
+	"github.com/corazawaf/coraza/v3/experimental"
 	"github.com/corazawaf/coraza/v3/types"
 )
 
@@ -85,27 +85,10 @@ func processRequest(tx types.Transaction, req *http.Request) (*types.Interruptio
 
 			// Adds all remaining bytes beyond the coraza limit to its buffer
 			// It happens when the partial body has been processed and it did not trigger an interruption
-			body := io.MultiReader(rbr, req.Body)
+			bodyReader := io.MultiReader(rbr, req.Body)
 			// req.Body is transparently reinizialied with a new io.ReadCloser.
 			// The http handler will be able to read it.
-			// Prior to Go 1.19 NopCloser does not implement WriterTo if the reader implements it.
-			// - https://github.com/golang/go/issues/51566
-			// - https://tip.golang.org/doc/go1.19#minor_library_changes
-			// This avoid errors like "failed to process request: malformed chunked encoding" when
-			// using io.Copy.
-			// In Go 1.19 we just do `req.Body = io.NopCloser(reader)`
-			if rwt, ok := body.(io.WriterTo); ok {
-				req.Body = struct {
-					io.Reader
-					io.WriterTo
-					io.Closer
-				}{body, rwt, req.Body}
-			} else {
-				req.Body = struct {
-					io.Reader
-					io.Closer
-				}{body, req.Body}
-			}
+			req.Body = io.NopCloser(bodyReader)
 		}
 	}
 
@@ -117,8 +100,20 @@ func WrapHandler(waf coraza.WAF, h http.Handler) http.Handler {
 		return h
 	}
 
+	newTX := func(*http.Request) types.Transaction {
+		return waf.NewTransaction()
+	}
+
+	if ctxwaf, ok := waf.(experimental.WAFWithOptions); ok {
+		newTX = func(r *http.Request) types.Transaction {
+			return ctxwaf.NewTransactionWithOptions(experimental.Options{
+				Context: r.Context(),
+			})
+		}
+	}
+
 	fn := func(w http.ResponseWriter, r *http.Request) {
-		tx := waf.NewTransaction()
+		tx := newTX(r)
 		defer func() {
 			// We run phase 5 rules and create audit logs (if enabled)
 			tx.ProcessLogging()
@@ -172,6 +167,5 @@ func obtainStatusCodeFromInterruptionOrDefault(it *types.Interruption, defaultSt
 
 		return statusCode
 	}
-
 	return defaultStatusCode
 }

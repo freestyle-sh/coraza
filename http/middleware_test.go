@@ -3,7 +3,6 @@
 
 // tinygo does not support net.http so this package is not needed for it
 //go:build !tinygo
-// +build !tinygo
 
 package http
 
@@ -101,8 +100,7 @@ SecRule &REQUEST_HEADERS:Transfer-Encoding "!@eq 0" "id:1,phase:1,deny"
 	}
 	if it == nil {
 		t.Fatal("Expected interruption")
-	}
-	if it.RuleID != 1 {
+	} else if it.RuleID != 1 {
 		t.Fatalf("Expected rule 1 to be triggered, got rule %d", it.RuleID)
 	}
 	if err := tx.Close(); err != nil {
@@ -239,42 +237,53 @@ type httpTest struct {
 	respBody                string
 	expectedProto           string
 	expectedStatus          int
+	expectedRespHeadersKeys []string
 	expectedRespBody        string
 }
+
+var expectedNoBlockingHeaders = []string{"Content-Type", "Content-Length", "Coraza-Middleware", "Date"}
+
+// When an interruption occur, we are expecting that no response headers are sent back to the client.
+var expectedBlockingHeaders = []string{"Content-Length", "Date"}
 
 func TestHttpServer(t *testing.T) {
 	tests := map[string]httpTest{
 		"no blocking": {
-			reqURI:         "/hello",
-			expectedProto:  "HTTP/1.1",
-			expectedStatus: 201,
+			reqURI:                  "/hello",
+			expectedProto:           "HTTP/1.1",
+			expectedStatus:          201,
+			expectedRespHeadersKeys: expectedNoBlockingHeaders,
 		},
 		"no blocking HTTP/2": {
-			http2:          true,
-			reqURI:         "/hello",
-			expectedProto:  "HTTP/2.0",
-			expectedStatus: 201,
+			http2:                   true,
+			reqURI:                  "/hello",
+			expectedProto:           "HTTP/2.0",
+			expectedStatus:          201,
+			expectedRespHeadersKeys: expectedNoBlockingHeaders,
 		},
 		"args blocking": {
-			reqURI:         "/hello?id=0",
-			expectedProto:  "HTTP/1.1",
-			expectedStatus: 403,
+			reqURI:                  "/hello?id=0",
+			expectedProto:           "HTTP/1.1",
+			expectedStatus:          403,
+			expectedRespHeadersKeys: expectedBlockingHeaders,
 		},
 		"request body blocking": {
-			reqURI:         "/hello",
-			reqBody:        "eval('cat /etc/passwd')",
-			expectedProto:  "HTTP/1.1",
-			expectedStatus: 403,
+			reqURI:                  "/hello",
+			reqBody:                 "eval('cat /etc/passwd')",
+			expectedProto:           "HTTP/1.1",
+			expectedStatus:          403,
+			expectedRespHeadersKeys: expectedBlockingHeaders,
 		},
 		"request body larger than limit (process partial)": {
 			reqURI:      "/hello",
 			reqBody:     "eval('cat /etc/passwd')",
 			echoReqBody: true,
 			// Coraza only sees eva, not eval
-			reqBodyLimit:     3,
-			expectedProto:    "HTTP/1.1",
-			expectedStatus:   201,
-			expectedRespBody: "eval('cat /etc/passwd')",
+			reqBodyLimit:            3,
+			expectedProto:           "HTTP/1.1",
+			expectedStatus:          201,
+			expectedRespHeadersKeys: expectedNoBlockingHeaders,
+			expectedRespBody:        "eval('cat /etc/passwd')",
 		},
 		"request body larger than limit (reject)": {
 			reqURI:                  "/hello",
@@ -284,37 +293,49 @@ func TestHttpServer(t *testing.T) {
 			shouldRejectOnBodyLimit: true,
 			expectedProto:           "HTTP/1.1",
 			expectedStatus:          413,
+			expectedRespHeadersKeys: expectedBlockingHeaders,
 			expectedRespBody:        "",
 		},
 		"response headers blocking": {
-			reqURI:         "/hello",
-			respHeaders:    map[string]string{"foo": "bar"},
-			expectedProto:  "HTTP/1.1",
-			expectedStatus: 401,
+			reqURI:                  "/hello",
+			respHeaders:             map[string]string{"foo": "bar"},
+			expectedProto:           "HTTP/1.1",
+			expectedStatus:          401,
+			expectedRespHeadersKeys: expectedBlockingHeaders,
 		},
 		"response body not blocking": {
-			reqURI:           "/hello",
-			respBody:         "true negative response body",
-			expectedProto:    "HTTP/1.1",
-			expectedStatus:   201,
-			expectedRespBody: "true negative response body",
+			reqURI:                  "/hello",
+			respBody:                "true negative response body",
+			expectedProto:           "HTTP/1.1",
+			expectedStatus:          201,
+			expectedRespHeadersKeys: expectedNoBlockingHeaders,
+			expectedRespBody:        "true negative response body",
 		},
 		"response body blocking": {
-			reqURI:           "/hello",
-			respBody:         "password=xxxx",
-			expectedProto:    "HTTP/1.1",
-			expectedStatus:   403,
-			expectedRespBody: "", // blocking at response body phase means returning it empty
+			reqURI:                  "/hello",
+			respBody:                "password=xxxx",
+			expectedProto:           "HTTP/1.1",
+			expectedStatus:          403,
+			expectedRespBody:        "", // blocking at response body phase means returning it empty
+			expectedRespHeadersKeys: expectedBlockingHeaders,
 		},
 		"allow": {
-			reqURI:         "/allow_me",
-			expectedProto:  "HTTP/1.1",
-			expectedStatus: 201,
+			reqURI:                  "/allow_me",
+			expectedProto:           "HTTP/1.1",
+			expectedStatus:          201,
+			expectedRespHeadersKeys: expectedNoBlockingHeaders,
 		},
 		"deny passes over allow due to ordering": {
-			reqURI:         "/allow_me?id=0",
-			expectedProto:  "HTTP/1.1",
-			expectedStatus: 403,
+			reqURI:                  "/allow_me?id=0",
+			expectedProto:           "HTTP/1.1",
+			expectedStatus:          403,
+			expectedRespHeadersKeys: expectedBlockingHeaders,
+		},
+		"deny based on number of post arguments matching a name": {
+			reqURI:                  "/hello?foobar=1&foobar=2",
+			expectedProto:           "HTTP/1.1",
+			expectedStatus:          403,
+			expectedRespHeadersKeys: expectedBlockingHeaders,
 		},
 	}
 
@@ -342,6 +363,7 @@ func TestHttpServer(t *testing.T) {
 	SecRule RESPONSE_HEADERS:Foo "@pm bar" "id:199,phase:3,deny,t:lowercase,deny, status:401,msg:'Invalid response header',log,auditlog"
 	SecRule RESPONSE_BODY "@contains password" "id:200, phase:4,deny, status:403,msg:'Invalid response body',log,auditlog"
 	SecRule REQUEST_URI "/allow_me" "id:9,phase:1,allow,msg:'ALLOWED'"
+	SecRule &ARGS_GET_NAMES:foobar "@eq 2" "id:11,phase:1,deny, status:403,msg:'Invalid foobar',log,auditlog"
 `).WithErrorCallback(errLogger(t)).WithDebugLogger(logger)
 			if l := tCase.reqBodyLimit; l > 0 {
 				conf = conf.WithRequestBodyAccess().WithRequestBodyLimit(l).WithRequestBodyInMemoryLimit(l)
@@ -358,26 +380,29 @@ func TestHttpServer(t *testing.T) {
 func TestHttpServerWithRuleEngineOff(t *testing.T) {
 	tests := map[string]httpTest{
 		"no blocking true negative": {
-			reqURI:           "/hello",
-			expectedProto:    "HTTP/1.1",
-			expectedStatus:   201,
-			respBody:         "Hello!",
-			expectedRespBody: "Hello!",
+			reqURI:                  "/hello",
+			expectedProto:           "HTTP/1.1",
+			expectedStatus:          201,
+			respBody:                "Hello!",
+			expectedRespHeadersKeys: expectedNoBlockingHeaders,
+			expectedRespBody:        "Hello!",
 		},
 		"no blocking true positive header phase": {
-			reqURI:           "/hello?id=0",
-			expectedProto:    "HTTP/1.1",
-			expectedStatus:   201,
-			respBody:         "Downstream works!",
-			expectedRespBody: "Downstream works!",
+			reqURI:                  "/hello?id=0",
+			expectedProto:           "HTTP/1.1",
+			expectedStatus:          201,
+			respBody:                "Downstream works!",
+			expectedRespHeadersKeys: expectedNoBlockingHeaders,
+			expectedRespBody:        "Downstream works!",
 		},
 		"no blocking true positive body phase": {
-			reqURI:           "/hello",
-			reqBody:          "eval('cat /etc/passwd')",
-			expectedProto:    "HTTP/1.1",
-			expectedStatus:   201,
-			respBody:         "Waf is Off!",
-			expectedRespBody: "Waf is Off!",
+			reqURI:                  "/hello",
+			reqBody:                 "eval('cat /etc/passwd')",
+			expectedProto:           "HTTP/1.1",
+			expectedStatus:          201,
+			respBody:                "Waf is Off!",
+			expectedRespHeadersKeys: expectedNoBlockingHeaders,
+			expectedRespBody:        "Waf is Off!",
 		},
 	}
 	logger := debuglog.Default().
@@ -459,6 +484,10 @@ func runAgainstWAF(t *testing.T, tCase httpTest, waf coraza.WAF) {
 		t.Errorf("unexpected status code, want: %d, have: %d", want, have)
 	}
 
+	if !keysExistInMap(t, tCase.expectedRespHeadersKeys, res.Header) {
+		t.Errorf("unexpected response headers, expected keys: %v, headers: %v", tCase.expectedRespHeadersKeys, res.Header)
+	}
+
 	resBody, err := io.ReadAll(res.Body)
 	if err != nil {
 		t.Fatalf("unexpected error when reading the response body: %v", err)
@@ -479,6 +508,19 @@ func runAgainstWAF(t *testing.T, tCase httpTest, waf coraza.WAF) {
 	default:
 		return
 	}
+}
+
+func keysExistInMap(t *testing.T, keys []string, m map[string][]string) bool {
+	t.Helper()
+	if len(keys) != len(m) {
+		return false
+	}
+	for _, key := range keys {
+		if _, ok := m[key]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func TestObtainStatusCodeFromInterruptionOrDefault(t *testing.T) {

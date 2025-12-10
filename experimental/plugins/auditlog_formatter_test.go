@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //go:build !tinygo
-// +build !tinygo
 
 // Not aimed to tinygo as serial writer is a noop writer
 
@@ -14,12 +13,21 @@ import (
 	"github.com/corazawaf/coraza/v3/experimental/plugins/plugintypes"
 )
 
+type testFormatter struct{}
+
+func (testFormatter) Format(al plugintypes.AuditLog) ([]byte, error) {
+	return []byte(al.Transaction().ID()), nil
+}
+
+func (testFormatter) MIME() string {
+	return "sample"
+}
+
 // ExampleRegisterAuditLogFormatter shows how to register a custom audit log formatter
 // and tests the output of the formatter.
 func ExampleRegisterAuditLogFormatter() {
-	plugins.RegisterAuditLogFormatter("txid", func(al plugintypes.AuditLog) ([]byte, error) {
-		return []byte(al.Transaction().ID()), nil
-	})
+
+	plugins.RegisterAuditLogFormatter("txid", &testFormatter{})
 
 	w, err := coraza.NewWAF(
 		coraza.NewWAFConfig().

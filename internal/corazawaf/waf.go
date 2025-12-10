@@ -4,6 +4,7 @@
 package corazawaf
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -11,7 +12,6 @@ import (
 	"os"
 	"regexp"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/corazawaf/coraza/v3/debuglog"
@@ -91,6 +91,7 @@ type WAF struct {
 	UploadDir string
 
 	// Request body in memory limit excluding the size of any files being transported in the request.
+	// TODO: SecRequestBodyNoFilesLimit directive is retrieving the value, but no logic based on it is implemented. See https://github.com/corazawaf/coraza/issues/896
 	RequestBodyNoFilesLimit int64
 
 	RequestBodyLimitAction types.BodyLimitAction
@@ -118,6 +119,9 @@ type WAF struct {
 	// Array of logging parts to be used
 	AuditLogParts types.AuditLogParts
 
+	// Audit log format
+	AuditLogFormat string
+
 	// Contains the regular expression for relevant status audit logging
 	AuditLogRelevantStatus *regexp.Regexp
 
@@ -133,30 +137,47 @@ type WAF struct {
 	ArgumentLimit int
 }
 
-// NewTransaction Creates a new initialized transaction for this WAF instance
-func (w *WAF) NewTransaction() *Transaction {
-	return w.newTransactionWithID(stringutils.RandomString(19))
+// Options is used to pass options to the WAF instance
+type Options struct {
+	ID      string
+	Context context.Context
 }
 
-func (w *WAF) NewTransactionWithID(id string) *Transaction {
-	if len(strings.TrimSpace(id)) == 0 {
-		id = stringutils.RandomString(19)
-		w.Logger.Warn().Msg("Empty ID passed for new transaction")
+// NewTransaction Creates a new initialized transaction for this WAF instance
+func (w *WAF) NewTransaction() *Transaction {
+	return w.newTransaction(Options{
+		ID:      stringutils.RandomString(19),
+		Context: context.Background(),
+	})
+}
+
+// NewTransactionWithOptions Creates a new initialized transaction for this WAF
+// instance with the provided options
+func (w *WAF) NewTransactionWithOptions(opts Options) *Transaction {
+	if opts.ID == "" {
+		opts.ID = stringutils.RandomString(19)
 	}
-	return w.newTransactionWithID(id)
+
+	if opts.Context == nil {
+		opts.Context = context.Background()
+	}
+
+	return w.newTransaction(opts)
 }
 
 // NewTransactionWithID Creates a new initialized transaction for this WAF instance
 // Using the specified ID
-func (w *WAF) newTransactionWithID(id string) *Transaction {
+func (w *WAF) newTransaction(opts Options) *Transaction {
 	tx := w.txPool.Get().(*Transaction)
-	tx.id = id
+	tx.id = opts.ID
+	tx.context = opts.Context
 	tx.matchedRules = []types.MatchedRule{}
 	tx.interruption = nil
-	tx.Logdata = ""
+	tx.Logdata = "" // Deprecated, this variable is not used. Logdata for each matched rule is stored in the MatchData field.
 	tx.SkipAfter = ""
 	tx.AuditEngine = w.AuditEngine
 	tx.AuditLogParts = w.AuditLogParts
+	tx.AuditLogFormat = w.AuditLogFormat
 	tx.ForceRequestBodyVariable = false
 	tx.RequestBodyAccess = w.RequestBodyAccess
 	tx.RequestBodyLimit = int64(w.RequestBodyLimit)
@@ -180,8 +201,8 @@ func (w *WAF) newTransactionWithID(id string) *Transaction {
 	// Always non-nil if buffers / collections were already initialized so we don't do any of them
 	// based on the presence of RequestBodyBuffer.
 	if tx.requestBodyBuffer == nil {
-		// if no requestBodyInMemoryLimit has been set we default to the
-		var requestBodyInMemoryLimit int64 = w.RequestBodyLimit
+		// if no requestBodyInMemoryLimit has been set we default to the requestBodyLimit
+		requestBodyInMemoryLimit := w.RequestBodyLimit
 		if w.requestBodyInMemoryLimit != nil {
 			requestBodyInMemoryLimit = int64(*w.requestBodyInMemoryLimit)
 		}
@@ -221,8 +242,9 @@ func (w *WAF) newTransactionWithID(id string) *Transaction {
 	tx.variables.duration.Set("0")
 	tx.variables.highestSeverity.Set("0")
 	tx.variables.uniqueID.Set(tx.id)
+	tx.setTimeVariables()
 
-	w.Logger.Debug().Msg("New transaction created")
+	tx.debugLogger.Debug().Msg("Transaction started")
 
 	return tx
 }
@@ -256,7 +278,7 @@ func (w *WAF) SetDebugLogPath(path string) error {
 	return nil
 }
 
-const _1gb = 1073741824
+const _1gib = 1073741824
 
 // NewWAF creates a new WAF instance with default variables
 func NewWAF() *WAF {
@@ -271,18 +293,26 @@ func NewWAF() *WAF {
 
 	waf := &WAF{
 		// Initializing pool for transactions
-		txPool: sync.NewPool(func() interface{} { return new(Transaction) }),
+		txPool: sync.NewPool(func() any { return new(Transaction) }),
 		// These defaults are unavoidable as they are zero values for the variables
 		RuleEngine:                types.RuleEngineOn,
 		RequestBodyAccess:         false,
-		RequestBodyLimit:          _1gb,
+		RequestBodyLimit:          134217728, // Hard limit equal to _1gib
+		RequestBodyLimitAction:    types.BodyLimitActionReject,
 		ResponseBodyAccess:        false,
-		ResponseBodyLimit:         _1gb,
+		ResponseBodyLimit:         524288, // Hard limit equal to _1gib
 		auditLogWriter:            logWriter,
 		auditLogWriterInitialized: false,
 		AuditLogWriterConfig:      auditlog.NewConfig(),
-		Logger:                    logger,
-		ArgumentLimit:             1000,
+		AuditLogParts: types.AuditLogParts{
+			types.AuditLogPartRequestHeaders,
+			types.AuditLogPartRequestBody,
+			types.AuditLogPartResponseHeaders,
+			types.AuditLogPartAuditLogTrailer,
+		},
+		AuditLogFormat: "Native",
+		Logger:         logger,
+		ArgumentLimit:  1000,
 	}
 
 	if environment.HasAccessToFS {
@@ -362,8 +392,8 @@ func (w *WAF) Validate() error {
 		return errors.New("request body limit should be bigger than 0")
 	}
 
-	if w.RequestBodyLimit > _1gb {
-		return errors.New("request body limit should be at most 1GB")
+	if w.RequestBodyLimit > _1gib {
+		return errors.New("request body limit should be at most 1GiB")
 	}
 
 	if w.requestBodyInMemoryLimit != nil {
@@ -380,8 +410,8 @@ func (w *WAF) Validate() error {
 		return errors.New("response body limit should be bigger than 0")
 	}
 
-	if w.ResponseBodyLimit > _1gb {
-		return errors.New("response body limit should be at most 1GB")
+	if w.ResponseBodyLimit > _1gib {
+		return errors.New("response body limit should be at most 1GiB")
 	}
 
 	if w.ArgumentLimit <= 0 {

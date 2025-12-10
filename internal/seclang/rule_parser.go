@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/corazawaf/coraza/v3/debuglog"
 	"github.com/corazawaf/coraza/v3/experimental/plugins/plugintypes"
 	actionsmod "github.com/corazawaf/coraza/v3/internal/actions"
 	"github.com/corazawaf/coraza/v3/internal/corazawaf"
@@ -70,13 +71,16 @@ func (rp *RuleParser) ParseVariables(vars string) error {
 			if err != nil {
 				return err
 			}
+			if curr == 1 && !v.CanBeSelected() {
+				return fmt.Errorf("attempting to select a value inside a non-selectable collection: %s", string(curVar))
+			}
 			// fmt.Printf("(PREVIOUS %s) %s:%s (%t %t)\n", vars, curvar, curkey, iscount, isnegation)
 			if isquoted {
 				// if it is quoted we remove the last quote
 				if len(vars) <= i+1 || vars[i+1] != '\'' {
 					if vars[i] != '\'' {
 						// TODO fix here
-						return fmt.Errorf("unclosed quote: " + string(curKey))
+						return fmt.Errorf("unclosed quote: %q", string(curKey))
 					}
 				}
 				// we skip one additional character
@@ -145,6 +149,9 @@ func (rp *RuleParser) ParseVariables(vars string) error {
 				isEscaped = !isEscaped
 			default:
 				curKey = append(curKey, c)
+				if isEscaped {
+					isEscaped = false
+				}
 			}
 		case 3:
 			// XPATH
@@ -212,7 +219,11 @@ func (rp *RuleParser) ParseOperator(operator string) error {
 // Each rule on the indicated phase will inherit the previously declared actions
 // If the user overwrites the default actions, the default actions will be overwritten
 func (rp *RuleParser) ParseDefaultActions(actions string) error {
-	act, err := parseActions(actions)
+	var logger debuglog.Logger
+	if rp.options.WAF != nil {
+		logger = rp.options.WAF.Logger
+	}
+	act, err := parseActions(logger, actions)
 	if err != nil {
 		return err
 	}
@@ -255,7 +266,7 @@ func (rp *RuleParser) ParseDefaultActions(actions string) error {
 // Arguments can be wrapper inside quotes
 func (rp *RuleParser) ParseActions(actions string) error {
 	disabledActions := rp.options.ParserConfig.DisabledRuleActions
-	act, err := parseActions(actions)
+	act, err := parseActions(rp.options.WAF.Logger, actions)
 	if err != nil {
 		return err
 	}
@@ -379,12 +390,14 @@ func ParseRule(options RuleOptions) (*corazawaf.Rule, error) {
 		}
 	}
 	rule := rp.Rule()
-	rule.Raw_ = options.Raw
 	rule.File_ = options.ParserConfig.ConfigFile
 	rule.Line_ = options.ParserConfig.LastLine
 
 	if parent := getLastRuleExpectingChain(options.WAF); parent != nil {
 		rule.ParentID_ = parent.ID_
+		// While the ID_ will be kept to 0 being a chain rule, the LogID_ is meant to be
+		// the printable ID that represents the chain rule, therefore the parent's ID is inherited.
+		rule.LogID_ = parent.LogID_
 		lastChain := parent
 		for lastChain.Chain != nil {
 			lastChain = lastChain.Chain
@@ -392,7 +405,12 @@ func ParseRule(options RuleOptions) (*corazawaf.Rule, error) {
 		// TODO we must remove defaultactions from chains
 		rule.Phase_ = 0
 		lastChain.Chain = rule
+		// This way we store the raw rule in the parent
+		parent.Raw_ += " \n" + options.Raw
 		return nil, nil
+	} else {
+		// we only want Raw for the parent
+		rule.Raw_ = options.Raw
 	}
 	return rule, nil
 }
@@ -436,12 +454,22 @@ func cutQuotedString(s string) (string, string, error) {
 		return "", "", fmt.Errorf("expected quoted string: %q", s)
 	}
 
+	previousEscapeCount := 0
 	for i := 1; i < len(s); i++ {
 		// Search until first quote that isn't part of an escape sequence.
+		// track the longest sequence of backslashes preceding the quote
+		// reset the count when a non-backslash character is encountered
 		if s[i] != '"' {
+			if s[i] == '\\' {
+				previousEscapeCount++
+			} else {
+				previousEscapeCount = 0
+			}
 			continue
 		}
-		if s[i-1] == '\\' {
+		// if the number of backslashes is odd, it's an escape sequence
+		if previousEscapeCount%2 == 1 {
+			previousEscapeCount = 0
 			continue
 		}
 
@@ -475,7 +503,7 @@ const unset = -1
 // parseActions will assign the function name, arguments and
 // function (pkg.actions) for each action split by comma (,)
 // Action arguments are allowed to wrap values between colons(”)
-func parseActions(actions string) ([]ruleAction, error) {
+func parseActions(logger debuglog.Logger, actions string) ([]ruleAction, error) {
 	var res []ruleAction
 	var err error
 	disruptiveActionIndex := unset
@@ -520,6 +548,12 @@ func parseActions(actions string) ([]ruleAction, error) {
 			}
 			beforeKey = i
 			afterKey = -1
+		}
+	}
+	if inQuotes {
+		// TODO(4.x): evaluate returning an error. It currently is a warning in order to don't make it a breaking change
+		if logger != nil {
+			logger.Warn().Str("actions", actions).Msg("unclosed quotes in action line")
 		}
 	}
 	var val string

@@ -3,12 +3,16 @@
 
 // Currently only used with TinyGo
 //go:build tinygo
-// +build tinygo
 
 package auditlog
 
 import "github.com/corazawaf/coraza/v3/experimental/plugins/plugintypes"
 
-func noopFormater(plugintypes.AuditLog) ([]byte, error) {
+type noopFormatter struct{}
+
+func (noopFormatter) Format(plugintypes.AuditLog) ([]byte, error) {
 	return nil, nil
+}
+func (noopFormatter) MIME() string {
+	return ""
 }

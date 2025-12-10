@@ -136,49 +136,52 @@ func (a *setvarFn) evaluateTxCollection(r plugintypes.RuleMetadata, tx plugintyp
 		col.Remove(key)
 		return
 	}
-	res := ""
+	currentVal := ""
 	if r := col.Get(key); len(r) > 0 {
-		res = r[0]
+		currentVal = r[0]
 	}
 	var err error
 	switch {
 	case len(value) == 0:
 		// if nothing to input
 		col.Set(key, []string{""})
-	case value[0] == '+':
-		// if we want to sum
-		sum := 0
-		if len(value) > 1 {
-			sum, err = strconv.Atoi(value[1:])
-			if err != nil {
-				tx.DebugLogger().Error().
-					Str("var_value", value).
-					Int("rule_id", r.ID()).
-					Err(err).
-					Msg("Invalid value")
-				return
-			}
-		}
+	// Check if this could be an arithemetic operation. If it is followed by a number, it will be treated as an arithmetic operation. Otherwise, it will be treated as a string.
+	case value[0] == '+', value[0] == '-':
 		val := 0
-		if res != "" {
-			val, err = strconv.Atoi(res)
+		if len(value) > 1 {
+			val, err = strconv.Atoi(value[1:])
+			if err != nil {
+				// If the variable doesn't exist, we would need to raise an error. Otherwise, it should be the same value.
+				if strings.HasPrefix(value[1:], "tx.") {
+					tx.DebugLogger().Error().
+						Str("var_value", value).
+						Int("rule_id", r.ID()).
+						Err(err).
+						Msg(value)
+					return
+				}
+
+				col.Set(key, []string{value})
+				return
+			}
+		}
+		currentValInt := 0
+		if currentVal != "" {
+			currentValInt, err = strconv.Atoi(currentVal)
 			if err != nil {
 				tx.DebugLogger().Error().
-					Str("var_key", res).
+					Str("var_key", currentVal).
 					Int("rule_id", r.ID()).
 					Err(err).
 					Msg("Invalid value")
 				return
 			}
 		}
-		col.Set(key, []string{strconv.Itoa(sum + val)})
-	case value[0] == '-':
-		me, _ := strconv.Atoi(value[1:])
-		txv, err := strconv.Atoi(res)
-		if err != nil {
-			return
+		if value[0] == '+' {
+			col.Set(key, []string{strconv.Itoa(currentValInt + val)})
+		} else {
+			col.Set(key, []string{strconv.Itoa(currentValInt - val)})
 		}
-		col.Set(key, []string{strconv.Itoa(txv - me)})
 	default:
 		col.Set(key, []string{value})
 	}

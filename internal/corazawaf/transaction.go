@@ -1,16 +1,18 @@
-// Copyright 2022 Juan Pablo Tosso and the OWASP Coraza contributors
+// Copyright 2024 Juan Pablo Tosso and the OWASP Coraza contributors
 // SPDX-License-Identifier: Apache-2.0
 
 package corazawaf
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"mime"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -22,8 +24,10 @@ import (
 	"github.com/corazawaf/coraza/v3/internal/auditlog"
 	"github.com/corazawaf/coraza/v3/internal/bodyprocessors"
 	"github.com/corazawaf/coraza/v3/internal/collections"
+	"github.com/corazawaf/coraza/v3/internal/cookies"
 	"github.com/corazawaf/coraza/v3/internal/corazarules"
 	"github.com/corazawaf/coraza/v3/internal/corazatypes"
+	"github.com/corazawaf/coraza/v3/internal/environment"
 	stringsutil "github.com/corazawaf/coraza/v3/internal/strings"
 	urlutil "github.com/corazawaf/coraza/v3/internal/url"
 	"github.com/corazawaf/coraza/v3/types"
@@ -41,6 +45,9 @@ type Transaction struct {
 	// Transaction ID
 	id string
 
+	// The context associated to the transaction.
+	context context.Context
+
 	// Contains the list of matched rules and associated match information
 	matchedRules []types.MatchedRule
 
@@ -48,6 +55,7 @@ type Transaction struct {
 	interruption *types.Interruption
 
 	// This is used to store log messages
+	// Deprecated since Coraza 3.0.5: this variable is not used, logdata values are stored in the matched rules
 	Logdata string
 
 	// Rules will be skipped after a rule with this SecMarker is found
@@ -59,6 +67,7 @@ type Transaction struct {
 	// Copies from the WAF instance that may be overwritten by the ctl action
 	AuditEngine               types.AuditEngineStatus
 	AuditLogParts             types.AuditLogParts
+	AuditLogFormat            string
 	ForceRequestBodyVariable  bool
 	RequestBodyAccess         bool
 	RequestBodyLimit          int64
@@ -271,6 +280,26 @@ func (tx *Transaction) Collection(idx variables.RuleVariable) collection.Collect
 		return tx.variables.xml
 	case variables.MultipartPartHeaders:
 		return tx.variables.multipartPartHeaders
+	case variables.MultipartStrictError:
+		return tx.variables.multipartStrictError
+	case variables.Time:
+		return tx.variables.time
+	case variables.TimeDay:
+		return tx.variables.timeDay
+	case variables.TimeEpoch:
+		return tx.variables.timeEpoch
+	case variables.TimeHour:
+		return tx.variables.timeHour
+	case variables.TimeMin:
+		return tx.variables.timeMin
+	case variables.TimeMon:
+		return tx.variables.timeMon
+	case variables.TimeSec:
+		return tx.variables.timeSec
+	case variables.TimeWday:
+		return tx.variables.timeWday
+	case variables.TimeYear:
+		return tx.variables.timeYear
 	}
 
 	return collections.Noop
@@ -319,8 +348,21 @@ func (tx *Transaction) AddRequestHeader(key string, value string) {
 			tx.variables.reqbodyProcessor.Set("MULTIPART")
 		}
 	case "cookie":
-		// Cookies use the same syntax as GET params but with semicolon (;) separator
-		values := urlutil.ParseQuery(value, ';')
+		// 4.2.  Cookie
+		//
+		// 4.2.1.  Syntax
+		//
+		//   The user agent sends stored cookies to the origin server in the
+		//   Cookie header.  If the server conforms to the requirements in
+		//   Section 4.1 (and the user agent conforms to the requirements in
+		//   Section 5), the user agent will send a Cookie header that conforms to
+		//   the following grammar:
+		//
+		//   cookie-header = "Cookie:" OWS cookie-string OWS
+		//   cookie-string = cookie-pair *( ";" SP cookie-pair )
+		//
+		// There is no URL Decode performed no the cookies
+		values := cookies.ParseCookies(value)
 		for k, vr := range values {
 			for _, v := range vr {
 				tx.variables.requestCookies.Add(k, v)
@@ -483,13 +525,21 @@ func (tx *Transaction) MatchRule(r *Rule, mds []types.MatchData) {
 		TransactionID_:   tx.id,
 		ServerIPAddress_: tx.variables.serverAddr.Get(),
 		ClientIPAddress_: tx.variables.remoteAddr.Get(),
-		Rule_:            r,
+		Rule_:            &r.RuleMetadata,
+		Log_:             r.Log,
 		MatchedDatas_:    mds,
+		Context_:         tx.context,
 	}
-	// Populate MatchedRule Disruptive_ field only if the Engine is capable of performing disruptive actions
+	// Populate MatchedRule disruption related fields only if the Engine is capable of performing disruptive actions
 	if tx.RuleEngine == types.RuleEngineOn {
+		var exists bool
 		for _, a := range r.actions {
+			// There can be only at most one disruptive action per rule
 			if a.Function.Type() == plugintypes.ActionTypeDisruptive {
+				mr.DisruptiveAction_, exists = corazarules.DisruptiveActionMap[a.Name]
+				if !exists {
+					mr.DisruptiveAction_ = corazarules.DisruptiveActionUnknown
+				}
 				mr.Disruptive_ = true
 				break
 			}
@@ -509,6 +559,7 @@ func (tx *Transaction) MatchRule(r *Rule, mds []types.MatchData) {
 	if tx.WAF.ErrorLogCb != nil && r.Log {
 		tx.WAF.ErrorLogCb(mr)
 	}
+
 }
 
 // GetStopWatch is used to debug phase durations
@@ -526,7 +577,7 @@ func (tx *Transaction) GetStopWatch() string {
 }
 
 // GetField Retrieve data from collections applying exceptions
-// In future releases we may remove de exceptions slice and
+// In future releases we may remove the exceptions slice and
 // make it easier to use
 func (tx *Transaction) GetField(rv ruleVariableParams) []types.MatchData {
 	col := tx.Collection(rv.Variable)
@@ -541,41 +592,40 @@ func (tx *Transaction) GetField(rv ruleVariableParams) []types.MatchData {
 		if m, ok := col.(collection.Keyed); ok {
 			matches = m.FindRegex(rv.KeyRx)
 		} else {
-			panic("attempted to use regex with non-selectable collection: " + rv.Variable.Name())
+			// This should probably never happen, selectability is checked at parsing time
+			tx.debugLogger.Error().Str("collection", rv.Variable.Name()).Msg("attempted to use regex with non-selectable collection")
 		}
 	case rv.KeyStr != "":
 		if m, ok := col.(collection.Keyed); ok {
 			matches = m.FindString(rv.KeyStr)
 		} else {
-			panic("attempted to use string with non-selectable collection: " + rv.Variable.Name())
+			// This should probably never happen, selectability is checked at parsing time
+			tx.debugLogger.Error().Str("collection", rv.Variable.Name()).Msg("attempted to use string with non-selectable collection")
 		}
 	default:
 		matches = col.FindAll()
 	}
 
-	var rmi []int
-	for i, c := range matches {
+	// in the most common scenario filteredMatches length will be
+	// the same as matches length, so we avoid allocating per result.
+	// We reuse the matches slice to store filtered results avoiding extra allocation.
+	filteredCount := 0
+	for _, c := range matches {
+		isException := false
+		lkey := strings.ToLower(c.Key())
 		for _, ex := range rv.Exceptions {
-			lkey := strings.ToLower(c.Key())
-			// in case it matches the regex or the keyStr
-			// Since keys are case sensitive we need to check with lower case
 			if (ex.KeyRx != nil && ex.KeyRx.MatchString(lkey)) || strings.ToLower(ex.KeyStr) == lkey {
-				// we remove the exception from the list of values
-				// we tried with standard append, but it fails... let's do some hacking
-				// m2 := append(matches[:i], matches[i+1:]...)
-				rmi = append(rmi, i)
+				isException = true
+				break
 			}
 		}
-	}
-	// we read the list of indexes backwards
-	// then we remove each one of them because of the exceptions
-	for i := len(rmi) - 1; i >= 0; i-- {
-		if len(matches) < rmi[i]+1 {
-			matches = matches[:rmi[i]-1]
-		} else {
-			matches = append(matches[:rmi[i]], matches[rmi[i]+1:]...)
+		if !isException {
+			matches[filteredCount] = c
+			filteredCount++
 		}
 	}
+	matches = matches[:filteredCount]
+
 	if rv.Count {
 		count := len(matches)
 		matches = []types.MatchData{
@@ -595,6 +645,23 @@ func (tx *Transaction) RemoveRuleTargetByID(id int, variable variables.RuleVaria
 	c := ruleVariableParams{
 		Variable: variable,
 		KeyStr:   key,
+	}
+
+	if multiphaseEvaluation && (variable == variables.Args || variable == variables.ArgsNames) {
+		// ARGS and ARGS_NAMES have to be splitted into _GET and _POST
+		switch variable {
+		case variables.Args:
+			c.Variable = variables.ArgsGet
+			tx.ruleRemoveTargetByID[id] = append(tx.ruleRemoveTargetByID[id], c)
+			c.Variable = variables.ArgsPost
+			tx.ruleRemoveTargetByID[id] = append(tx.ruleRemoveTargetByID[id], c)
+		case variables.ArgsNames:
+			c.Variable = variables.ArgsGetNames
+			tx.ruleRemoveTargetByID[id] = append(tx.ruleRemoveTargetByID[id], c)
+			c.Variable = variables.ArgsPostNames
+			tx.ruleRemoveTargetByID[id] = append(tx.ruleRemoveTargetByID[id], c)
+		}
+		return
 	}
 	tx.ruleRemoveTargetByID[id] = append(tx.ruleRemoveTargetByID[id], c)
 }
@@ -700,7 +767,7 @@ func (tx *Transaction) ProcessURI(uri string, method string, httpVersion string)
 		uri = uri[:in]
 	}
 	path := ""
-	parsedURL, err := url.Parse(uri)
+	parsedURL, err := url.ParseRequestURI(uri)
 	query := ""
 	if err != nil {
 		tx.variables.urlencodedError.Set(err.Error())
@@ -772,10 +839,10 @@ func (tx *Transaction) ProcessRequestHeaders() *types.Interruption {
 	return tx.interruption
 }
 
-func setAndReturnBodyLimitInterruption(tx *Transaction) (*types.Interruption, int, error) {
+func setAndReturnBodyLimitInterruption(tx *Transaction, status int) (*types.Interruption, int, error) {
 	tx.debugLogger.Warn().Msg("Disrupting transaction with body size above the configured limit (Action Reject)")
 	tx.interruption = &types.Interruption{
-		Status: 413,
+		Status: status,
 		Action: "deny",
 	}
 	return tx.interruption, 0, nil
@@ -820,7 +887,7 @@ func (tx *Transaction) WriteRequestBody(b []byte) (*types.Interruption, int, err
 		tx.variables.inboundDataError.Set("1")
 		if tx.WAF.RequestBodyLimitAction == types.BodyLimitActionReject {
 			// We interrupt this transaction in case RequestBodyLimitAction is Reject
-			return setAndReturnBodyLimitInterruption(tx)
+			return setAndReturnBodyLimitInterruption(tx, 413)
 		}
 
 		if tx.WAF.RequestBodyLimitAction == types.BodyLimitActionProcessPartial {
@@ -885,7 +952,7 @@ func (tx *Transaction) ReadRequestBodyFrom(r io.Reader) (*types.Interruption, in
 		if tx.requestBodyBuffer.length+writingBytes >= tx.RequestBodyLimit {
 			tx.variables.inboundDataError.Set("1")
 			if tx.WAF.RequestBodyLimitAction == types.BodyLimitActionReject {
-				return setAndReturnBodyLimitInterruption(tx)
+				return setAndReturnBodyLimitInterruption(tx, 413)
 			}
 
 			if tx.WAF.RequestBodyLimitAction == types.BodyLimitActionProcessPartial {
@@ -903,8 +970,9 @@ func (tx *Transaction) ReadRequestBodyFrom(r io.Reader) (*types.Interruption, in
 	}
 
 	if tx.requestBodyBuffer.length == tx.RequestBodyLimit {
+		tx.variables.inboundDataError.Set("1")
 		if tx.WAF.RequestBodyLimitAction == types.BodyLimitActionReject {
-			return setAndReturnBodyLimitInterruption(tx)
+			return setAndReturnBodyLimitInterruption(tx, 413)
 		}
 
 		if tx.WAF.RequestBodyLimitAction == types.BodyLimitActionProcessPartial {
@@ -922,9 +990,9 @@ func (tx *Transaction) ReadRequestBodyFrom(r io.Reader) (*types.Interruption, in
 
 // ProcessRequestBody Performs the analysis of the request body (if any)
 //
-// This method perform the analysis on the request body. It is optional to
-// call that function. If this API consumer already knows that there isn't a
-// body for inspect it is recommended to skip this step.
+// It is recommended to call this method even if it is not expected to have a body.
+// It permits to execute rules belonging to request body phase, but not necessarily
+// processing the request body.
 //
 // Remember to check for a possible intervention.
 func (tx *Transaction) ProcessRequestBody() (*types.Interruption, error) {
@@ -938,11 +1006,15 @@ func (tx *Transaction) ProcessRequestBody() (*types.Interruption, error) {
 	}
 
 	if tx.lastPhase != types.PhaseRequestHeaders {
-		if tx.lastPhase >= types.PhaseRequestBody {
-			// Phase already evaluated or skipped
-			tx.debugLogger.Warn().Msg("ProcessRequestBody should have already been called")
-		} else {
-			tx.debugLogger.Debug().Msg("Skipping request body processing, anomalous call before request headers evaluation")
+		switch {
+		case tx.lastPhase == types.PhaseRequestBody:
+			// This condition can happen quite often when ProcessPartial is used as the write body functions call ProcessRequestBody when
+			// the limit is reached
+			tx.debugLogger.Debug().Msg("Request body processing has been already performed")
+		case tx.lastPhase > types.PhaseRequestBody:
+			tx.debugLogger.Warn().Msg("Skipping anomalous call to ProcessRequestBody. It should have already been called")
+		default:
+			tx.debugLogger.Warn().Msg("Skipping anomalous call to ProcessRequestBody. It has been called before request headers evaluation")
 		}
 		return nil, nil
 	}
@@ -1004,12 +1076,12 @@ func (tx *Transaction) ProcessRequestBody() (*types.Interruption, error) {
 	return tx.interruption, nil
 }
 
-// ProcessResponseHeaders Perform the analysis on the response readers.
+// ProcessResponseHeaders performs the analysis on the response headers.
 //
-// This method perform the analysis on the response headers, notice however
+// This method performs the analysis on the response headers. Note, however,
 // that the headers should be added prior to the execution of this function.
 //
-// note: Remember to check for a possible intervention.
+// Note: Remember to check for a possible intervention.
 func (tx *Transaction) ProcessResponseHeaders(code int, proto string) *types.Interruption {
 	if tx.RuleEngine == types.RuleEngineOff {
 		return nil
@@ -1078,11 +1150,10 @@ func (tx *Transaction) WriteResponseBody(b []byte) (*types.Interruption, int, er
 		runProcessResponseBody = false
 	)
 	if tx.responseBodyBuffer.length+writingBytes >= tx.ResponseBodyLimit {
-		// TODO: figure out ErrorData vs DataError: https://github.com/corazawaf/coraza/issues/564
 		tx.variables.outboundDataError.Set("1")
 		if tx.WAF.ResponseBodyLimitAction == types.BodyLimitActionReject {
 			// We interrupt this transaction in case ResponseBodyLimitAction is Reject
-			return setAndReturnBodyLimitInterruption(tx)
+			return setAndReturnBodyLimitInterruption(tx, 500)
 		}
 
 		if tx.WAF.ResponseBodyLimitAction == types.BodyLimitActionProcessPartial {
@@ -1130,10 +1201,9 @@ func (tx *Transaction) ReadResponseBodyFrom(r io.Reader) (*types.Interruption, i
 	if l, ok := r.(ByteLenger); ok {
 		writingBytes = int64(l.Len())
 		if tx.responseBodyBuffer.length+writingBytes >= tx.ResponseBodyLimit {
-			// TODO: figure out ErrorData vs DataError: https://github.com/corazawaf/coraza/issues/564
 			tx.variables.outboundDataError.Set("1")
 			if tx.WAF.ResponseBodyLimitAction == types.BodyLimitActionReject {
-				return setAndReturnBodyLimitInterruption(tx)
+				return setAndReturnBodyLimitInterruption(tx, 500)
 			}
 
 			if tx.WAF.ResponseBodyLimitAction == types.BodyLimitActionProcessPartial {
@@ -1151,8 +1221,9 @@ func (tx *Transaction) ReadResponseBodyFrom(r io.Reader) (*types.Interruption, i
 	}
 
 	if tx.responseBodyBuffer.length == tx.ResponseBodyLimit {
+		tx.variables.outboundDataError.Set("1")
 		if tx.WAF.ResponseBodyLimitAction == types.BodyLimitActionReject {
-			return setAndReturnBodyLimitInterruption(tx)
+			return setAndReturnBodyLimitInterruption(tx, 500)
 		}
 
 		if tx.WAF.ResponseBodyLimitAction == types.BodyLimitActionProcessPartial {
@@ -1169,9 +1240,9 @@ func (tx *Transaction) ReadResponseBodyFrom(r io.Reader) (*types.Interruption, i
 
 // ProcessResponseBody Perform the analysis of the the response body (if any)
 //
-// This method perform the analysis on the response body. It is optional to
-// call that method. If this API consumer already knows that there isn't a
-// body for inspect it is recommended to skip this step.
+// It is recommended to call this method even if it is not expected to have a body.
+// It permits to execute rules belonging to request body phase, but not necessarily
+// processing the response body.
 //
 // note Remember to check for a possible intervention.
 func (tx *Transaction) ProcessResponseBody() (*types.Interruption, error) {
@@ -1185,14 +1256,18 @@ func (tx *Transaction) ProcessResponseBody() (*types.Interruption, error) {
 	}
 
 	if tx.lastPhase != types.PhaseResponseHeaders {
-		if tx.lastPhase >= types.PhaseResponseBody {
-			// Phase already evaluated or skipped
-			tx.debugLogger.Warn().Msg("ProcessResponseBody should have already been called")
-		} else {
+		switch {
+		case tx.lastPhase == types.PhaseResponseBody:
+			// This condition can happen quite often when ProcessPartial is used as the write body functions call ProcessResponseBody when
+			// the limit is reached
+			tx.debugLogger.Debug().Msg("Response body processing has been already performed")
+		case tx.lastPhase > types.PhaseResponseBody:
+			tx.debugLogger.Warn().Msg("Skipping anomalous call to ProcessResponseBody. It should have already been called")
+		default:
 			// Prevents evaluating response body rules if last phase has not been response headers. It may happen
 			// when a server returns an error prior to evaluating WAF rules, but ResponseBody is still called at
 			// the end of http stream
-			tx.debugLogger.Debug().Msg("Skipping response body processing, anomalous call before response headers evaluation")
+			tx.debugLogger.Warn().Msg("Skipping anomalous call to ProcessResponseBody. It has been called before response headers evaluation")
 		}
 		return nil, nil
 	}
@@ -1237,8 +1312,7 @@ func (tx *Transaction) ProcessResponseBody() (*types.Interruption, error) {
 	return tx.interruption, nil
 }
 
-// ProcessLogging Logging all information relative to this transaction.
-// An error log
+// ProcessLogging logs all information relative to this transaction.
 // At this point there is not need to hold the connection, the response can be
 // delivered prior to the execution of this method.
 func (tx *Transaction) ProcessLogging() {
@@ -1266,6 +1340,9 @@ func (tx *Transaction) ProcessLogging() {
 	if tx.AuditEngine == types.AuditEngineRelevantOnly && tx.audit {
 		re := tx.WAF.AuditLogRelevantStatus
 		status := tx.variables.responseStatus.Get()
+		if tx.IsInterrupted() {
+			status = strconv.Itoa(tx.interruption.Status)
+		}
 		if re != nil && !re.Match([]byte(status)) {
 			// Not relevant status
 			tx.debugLogger.Debug().
@@ -1326,6 +1403,18 @@ func (tx *Transaction) AuditLog() *auditlog.Log {
 
 	clientPort, _ := strconv.Atoi(tx.variables.remotePort.Get())
 	hostPort, _ := strconv.Atoi(tx.variables.serverPort.Get())
+
+	// Convert the transaction fullRequestLength to Int32
+	requestLength, err := strconv.ParseInt(tx.variables.fullRequestLength.Get(), 10, 32)
+	if err != nil {
+		requestLength = 0
+		tx.DebugLogger().Error().
+			Str("transaction", "AuditLog").
+			Str("value", tx.variables.fullRequestLength.Get()).
+			Err(err).
+			Msg("Error converting request length to integer")
+	}
+
 	// YYYY/MM/DD HH:mm:ss
 	ts := time.Unix(0, tx.Timestamp).Format("2006/01/02 15:04:05")
 	al.Transaction_ = auditlog.Transaction{
@@ -1337,22 +1426,29 @@ func (tx *Transaction) AuditLog() *auditlog.Log {
 		HostIP_:        tx.variables.serverAddr.Get(),
 		HostPort_:      hostPort,
 		ServerID_:      tx.variables.serverName.Get(), // TODO check
+		Request_: &auditlog.TransactionRequest{
+			Method_:   tx.variables.requestMethod.Get(),
+			URI_:      tx.variables.requestURI.Get(),
+			Protocol_: tx.variables.requestProtocol.Get(),
+			Args_:     tx.variables.args,
+			Length_:   int32(requestLength),
+		},
+		IsInterrupted_: tx.IsInterrupted(),
 	}
 
+	var auditLogPartAuditLogTrailerSet, auditLogPartRulesMatchedSet bool
 	for _, part := range tx.AuditLogParts {
 		switch part {
 		case types.AuditLogPartRequestHeaders:
-			if al.Transaction_.Request_ == nil {
-				al.Transaction_.Request_ = &auditlog.TransactionRequest{}
-			}
 			al.Transaction_.Request_.Headers_ = tx.variables.requestHeaders.Data()
 		case types.AuditLogPartRequestBody:
-			if al.Transaction_.Request_ == nil {
-				al.Transaction_.Request_ = &auditlog.TransactionRequest{}
+			reader, err := tx.requestBodyBuffer.Reader()
+			if err == nil {
+				content, err := io.ReadAll(reader)
+				if err == nil {
+					al.Transaction_.Request_.Body_ = string(content)
+				}
 			}
-			// TODO maybe change to:
-			// al.Transaction.Request.Body = tx.RequestBodyBuffer.String()
-			al.Transaction_.Request_.Body_ = tx.variables.requestBody.Get()
 
 			/*
 			* TODO:
@@ -1393,6 +1489,7 @@ func (tx *Transaction) AuditLog() *auditlog.Log {
 			al.Transaction_.Response_.Status_ = status
 			al.Transaction_.Response_.Headers_ = tx.variables.responseHeaders.Data()
 		case types.AuditLogPartAuditLogTrailer:
+			auditLogPartAuditLogTrailerSet = true
 			al.Transaction_.Producer_ = &auditlog.TransactionProducer{
 				Connector_:  tx.WAF.ProducerConnector,
 				Version_:    tx.WAF.ProducerConnectorVersion,
@@ -1402,30 +1499,57 @@ func (tx *Transaction) AuditLog() *auditlog.Log {
 				Rulesets_:   tx.WAF.ComponentNames,
 			}
 		case types.AuditLogPartRulesMatched:
+			auditLogPartRulesMatchedSet = true
 			for _, mr := range tx.matchedRules {
-				r := mr.Rule()
-				for _, matchData := range mr.MatchedDatas() {
-					al.Messages_ = append(al.Messages_, auditlog.Message{
-						Actionset_: strings.Join(tx.WAF.ComponentNames, " "),
-						Message_:   matchData.Message(),
-						Data_: &auditlog.MessageData{
-							File_:     mr.Rule().File(),
-							Line_:     mr.Rule().Line(),
-							ID_:       r.ID(),
-							Rev_:      r.Revision(),
-							Msg_:      matchData.Message(),
-							Data_:     matchData.Data(),
-							Severity_: r.Severity(),
-							Ver_:      r.Version(),
-							Maturity_: r.Maturity(),
-							Accuracy_: r.Accuracy(),
-							Tags_:     r.Tags(),
-							Raw_:      r.Raw(),
-						},
-					})
+				// Log action is required to log a matched rule on both error log and audit log
+				// An assertion has to be done to check if the MatchedRule implements the Log() function before calling Log()
+				// It is performed to avoid breaking the Coraza v3.* API adding a Log() method to the MatchedRule interface
+				mrWithlog, ok := mr.(*corazarules.MatchedRule)
+				if ok && mrWithlog.Log() {
+					r := mr.Rule()
+					for _, matchData := range mr.MatchedDatas() {
+						newAlEntry := auditlog.Message{
+							Actionset_: strings.Join(tx.WAF.ComponentNames, " "),
+							Message_:   matchData.Message(),
+							Data_: &auditlog.MessageData{
+								File_:     mr.Rule().File(),
+								Line_:     mr.Rule().Line(),
+								ID_:       r.ID(),
+								Rev_:      r.Revision(),
+								Msg_:      matchData.Message(),
+								Data_:     matchData.Data(),
+								Severity_: r.Severity(),
+								Ver_:      r.Version(),
+								Maturity_: r.Maturity(),
+								Accuracy_: r.Accuracy(),
+								Tags_:     r.Tags(),
+								Raw_:      r.Raw(),
+							},
+						}
+						// If AuditLogPartAuditLogTrailer (H) is set, we expect to log the error messages emitted by the rules
+						// in the audit log
+						if auditLogPartAuditLogTrailerSet {
+							newAlEntry.ErrorMessage_ = mr.ErrorLog()
+						}
+						al.Messages_ = append(al.Messages_, newAlEntry)
+					}
 				}
 			}
 		}
+	}
+
+	// If AuditLogPartRulesMatched (K) is not set, but AuditLogPartAuditLogTrailer (H) is set, we still expect to
+	// log the error messages emitted by the rules (if the rule has Log set to true)
+	if !auditLogPartRulesMatchedSet && auditLogPartAuditLogTrailerSet {
+		for _, mr := range tx.matchedRules {
+			mrWithlog, ok := mr.(*corazarules.MatchedRule)
+			if ok && mrWithlog.Log() {
+				al.Messages_ = append(al.Messages_, auditlog.Message{
+					ErrorMessage_: mr.ErrorLog(),
+				})
+			}
+		}
+
 	}
 
 	return al
@@ -1436,13 +1560,25 @@ func (tx *Transaction) AuditLog() *auditlog.Log {
 // It also allows caches the transaction back into the sync.Pool
 func (tx *Transaction) Close() error {
 	defer tx.WAF.txPool.Put(tx)
-	tx.variables.reset()
+
 	var errs []error
+	if environment.HasAccessToFS {
+		// TODO(jcchavezs): filesTmpNames should probably be a new kind of collection that
+		// is aware of the files and then attempt to delete them when the collection
+		// is resetted or an item is removed.
+		for _, file := range tx.variables.filesTmpNames.Get("") {
+			if err := os.Remove(file); err != nil {
+				errs = append(errs, fmt.Errorf("removing temporary file: %v", err))
+			}
+		}
+	}
+
+	tx.variables.reset()
 	if err := tx.requestBodyBuffer.Reset(); err != nil {
-		errs = append(errs, err)
+		errs = append(errs, fmt.Errorf("reseting request body buffer: %v", err))
 	}
 	if err := tx.responseBodyBuffer.Reset(); err != nil {
-		errs = append(errs, err)
+		errs = append(errs, fmt.Errorf("reseting response body buffer: %v", err))
 	}
 
 	tx.matchedRules = nil
@@ -1458,14 +1594,11 @@ func (tx *Transaction) Close() error {
 			Msg("Transaction finished")
 	}
 
-	switch {
-	case len(errs) == 0:
+	if len(errs) == 0 {
 		return nil
-	case len(errs) == 1:
-		return fmt.Errorf("transaction close failed: %s", errs[0].Error())
-	default:
-		return fmt.Errorf("transaction close failed:\n- %s\n- %s", errs[0].Error(), errs[1].Error())
 	}
+
+	return fmt.Errorf("transaction close failed: %v", errors.Join(errs...))
 }
 
 // String will return a string with the transaction debug information
@@ -1502,16 +1635,35 @@ func (tx *Transaction) generateResponseBodyError(err error) {
 	tx.variables.resBodyProcessorErrorMsg.Set(err.Error())
 }
 
+// setTimeVariables sets all the time variables
+func (tx *Transaction) setTimeVariables() {
+	timestamp := time.Unix(0, tx.Timestamp)
+	tx.variables.timeEpoch.Set(strconv.FormatInt(timestamp.Unix(), 10))
+
+	timeOnly := timestamp.Format(time.TimeOnly)
+	tx.variables.time.Set(timeOnly)
+	tx.variables.timeHour.Set(timeOnly[0:2])
+	tx.variables.timeMin.Set(timeOnly[3:5])
+	tx.variables.timeSec.Set(timeOnly[6:8])
+
+	y, m, d := timestamp.Date()
+	tx.variables.timeDay.Set(strconv.Itoa(d))
+	tx.variables.timeMon.Set(strconv.Itoa(int(m)))
+	tx.variables.timeYear.Set(strconv.Itoa(y))
+
+	tx.variables.timeWday.Set(strconv.Itoa(int(timestamp.Weekday())))
+}
+
 // TransactionVariables has pointers to all the variables of the transaction
 type TransactionVariables struct {
 	args                     *collections.ConcatKeyed
 	argsCombinedSize         *collections.SizeCollection
 	argsGet                  *collections.NamedCollection
-	argsGetNames             collection.Collection
-	argsNames                *collections.ConcatCollection
+	argsGetNames             collection.Keyed
+	argsNames                *collections.ConcatKeyed
 	argsPath                 *collections.NamedCollection
 	argsPost                 *collections.NamedCollection
-	argsPostNames            collection.Collection
+	argsPostNames            collection.Keyed
 	duration                 *collections.Single
 	env                      *collections.Map
 	files                    *collections.Map
@@ -1527,11 +1679,12 @@ type TransactionVariables struct {
 	matchedVar               *collections.Single
 	matchedVarName           *collections.Single
 	matchedVars              *collections.NamedCollection
-	matchedVarsNames         collection.Collection
+	matchedVarsNames         collection.Keyed
 	multipartDataAfter       *collections.Single
 	multipartFilename        *collections.Map
 	multipartName            *collections.Map
 	multipartPartHeaders     *collections.Map
+	multipartStrictError     *collections.Single
 	outboundDataError        *collections.Single
 	queryString              *collections.Single
 	remoteAddr               *collections.Single
@@ -1546,10 +1699,10 @@ type TransactionVariables struct {
 	requestBody              *collections.Single
 	requestBodyLength        *collections.Single
 	requestCookies           *collections.NamedCollection
-	requestCookiesNames      collection.Collection
+	requestCookiesNames      collection.Keyed
 	requestFilename          *collections.Single
 	requestHeaders           *collections.NamedCollection
-	requestHeadersNames      collection.Collection
+	requestHeadersNames      collection.Keyed
 	requestLine              *collections.Single
 	requestMethod            *collections.Single
 	requestProtocol          *collections.Single
@@ -1560,7 +1713,7 @@ type TransactionVariables struct {
 	responseContentLength    *collections.Single
 	responseContentType      *collections.Single
 	responseHeaders          *collections.NamedCollection
-	responseHeadersNames     collection.Collection
+	responseHeadersNames     collection.Keyed
 	responseProtocol         *collections.Single
 	responseStatus           *collections.Single
 	responseXML              *collections.Map
@@ -1579,6 +1732,15 @@ type TransactionVariables struct {
 	resBodyErrorMsg          *collections.Single
 	resBodyProcessorError    *collections.Single
 	resBodyProcessorErrorMsg *collections.Single
+	time                     *collections.Single
+	timeDay                  *collections.Single
+	timeEpoch                *collections.Single
+	timeHour                 *collections.Single
+	timeMin                  *collections.Single
+	timeMon                  *collections.Single
+	timeSec                  *collections.Single
+	timeWday                 *collections.Single
+	timeYear                 *collections.Single
 }
 
 func NewTransactionVariables() *TransactionVariables {
@@ -1650,15 +1812,32 @@ func NewTransactionVariables() *TransactionVariables {
 	v.responseXML = collections.NewMap(variables.ResponseXML)
 	v.requestXML = collections.NewMap(variables.RequestXML)
 	v.multipartPartHeaders = collections.NewMap(variables.MultipartPartHeaders)
+	v.multipartStrictError = collections.NewSingle(variables.MultipartStrictError)
+	v.time = collections.NewSingle(variables.Time)
+	v.timeDay = collections.NewSingle(variables.TimeDay)
+	v.timeEpoch = collections.NewSingle(variables.TimeEpoch)
+	v.timeHour = collections.NewSingle(variables.TimeHour)
+	v.timeMin = collections.NewSingle(variables.TimeMin)
+	v.timeMon = collections.NewSingle(variables.TimeMon)
+	v.timeSec = collections.NewSingle(variables.TimeSec)
+	v.timeWday = collections.NewSingle(variables.TimeWday)
+	v.timeYear = collections.NewSingle(variables.TimeYear)
 
 	// XML is a pointer to RequestXML
 	v.xml = v.requestXML
 
-	v.argsGet = collections.NewNamedCollection(variables.ArgsGet)
+	if shouldUseCaseSensitiveNamedCollection {
+		v.argsGet = collections.NewCaseSensitiveNamedCollection(variables.ArgsGet)
+		v.argsPost = collections.NewCaseSensitiveNamedCollection(variables.ArgsPost)
+		v.argsPath = collections.NewCaseSensitiveNamedCollection(variables.ArgsPath)
+	} else {
+		v.argsGet = collections.NewNamedCollection(variables.ArgsGet)
+		v.argsPost = collections.NewNamedCollection(variables.ArgsPost)
+		v.argsPath = collections.NewNamedCollection(variables.ArgsPath)
+	}
+
 	v.argsGetNames = v.argsGet.Names(variables.ArgsGetNames)
-	v.argsPost = collections.NewNamedCollection(variables.ArgsPost)
 	v.argsPostNames = v.argsPost.Names(variables.ArgsPostNames)
-	v.argsPath = collections.NewNamedCollection(variables.ArgsPath)
 	v.argsCombinedSize = collections.NewSizeCollection(variables.ArgsCombinedSize, v.argsGet, v.argsPost)
 	v.args = collections.NewConcatKeyed(
 		variables.Args,
@@ -1666,7 +1845,7 @@ func NewTransactionVariables() *TransactionVariables {
 		v.argsPost,
 		v.argsPath,
 	)
-	v.argsNames = collections.NewConcatCollection(
+	v.argsNames = collections.NewConcatKeyed(
 		variables.ArgsNames,
 		v.argsGetNames,
 		v.argsPostNames,
@@ -1892,7 +2071,7 @@ func (v *TransactionVariables) MultipartName() collection.Map {
 	return v.multipartName
 }
 
-func (v *TransactionVariables) MatchedVarsNames() collection.Collection {
+func (v *TransactionVariables) MatchedVarsNames() collection.Keyed {
 	return v.matchedVarsNames
 }
 
@@ -1916,7 +2095,7 @@ func (v *TransactionVariables) FilesTmpContent() collection.Map {
 	return v.filesTmpContent
 }
 
-func (v *TransactionVariables) ResponseHeadersNames() collection.Collection {
+func (v *TransactionVariables) ResponseHeadersNames() collection.Keyed {
 	return v.responseHeadersNames
 }
 
@@ -1924,11 +2103,11 @@ func (v *TransactionVariables) ResponseArgs() collection.Map {
 	return v.responseArgs
 }
 
-func (v *TransactionVariables) RequestHeadersNames() collection.Collection {
+func (v *TransactionVariables) RequestHeadersNames() collection.Keyed {
 	return v.requestHeadersNames
 }
 
-func (v *TransactionVariables) RequestCookiesNames() collection.Collection {
+func (v *TransactionVariables) RequestCookiesNames() collection.Keyed {
 	return v.requestCookiesNames
 }
 
@@ -1948,15 +2127,15 @@ func (v *TransactionVariables) ResponseBodyProcessor() collection.Single {
 	return v.resBodyProcessor
 }
 
-func (v *TransactionVariables) ArgsNames() collection.Collection {
+func (v *TransactionVariables) ArgsNames() collection.Keyed {
 	return v.argsNames
 }
 
-func (v *TransactionVariables) ArgsGetNames() collection.Collection {
+func (v *TransactionVariables) ArgsGetNames() collection.Keyed {
 	return v.argsGetNames
 }
 
-func (v *TransactionVariables) ArgsPostNames() collection.Collection {
+func (v *TransactionVariables) ArgsPostNames() collection.Keyed {
 	return v.argsPostNames
 }
 
@@ -1974,6 +2153,10 @@ func (v *TransactionVariables) ResBodyProcessorError() collection.Single {
 
 func (v *TransactionVariables) ResBodyProcessorErrorMsg() collection.Single {
 	return v.resBodyProcessorErrorMsg
+}
+
+func (v *TransactionVariables) MultipartStrictError() collection.Single {
+	return v.multipartStrictError
 }
 
 // All iterates over the variables. We return both variable and its collection, i.e. key/value, to follow
@@ -2063,6 +2246,9 @@ func (v *TransactionVariables) All(f func(v variables.RuleVariable, col collecti
 		return
 	}
 	if !f(variables.MultipartPartHeaders, v.multipartPartHeaders) {
+		return
+	}
+	if !f(variables.MultipartStrictError, v.multipartStrictError) {
 		return
 	}
 	if !f(variables.OutboundDataError, v.outboundDataError) {
@@ -2192,6 +2378,33 @@ func (v *TransactionVariables) All(f func(v variables.RuleVariable, col collecti
 		return
 	}
 	if !f(variables.XML, v.xml) {
+		return
+	}
+	if !f(variables.Time, v.time) {
+		return
+	}
+	if !f(variables.TimeDay, v.timeDay) {
+		return
+	}
+	if !f(variables.TimeEpoch, v.timeEpoch) {
+		return
+	}
+	if !f(variables.TimeHour, v.timeHour) {
+		return
+	}
+	if !f(variables.TimeMin, v.timeMin) {
+		return
+	}
+	if !f(variables.TimeMon, v.timeMon) {
+		return
+	}
+	if !f(variables.TimeSec, v.timeSec) {
+		return
+	}
+	if !f(variables.TimeWday, v.timeWday) {
+		return
+	}
+	if !f(variables.TimeYear, v.timeYear) {
 		return
 	}
 }
