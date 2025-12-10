@@ -614,7 +614,11 @@ func (tx *Transaction) GetField(rv ruleVariableParams) []types.MatchData {
 		isException := false
 		lkey := strings.ToLower(c.Key())
 		for _, ex := range rv.Exceptions {
-			if (ex.KeyRx != nil && ex.KeyRx.MatchString(lkey)) || strings.ToLower(ex.KeyStr) == lkey {
+			// Empty key with nil regex = match all keys (exclude entire collection)
+			// This allows SecRuleUpdateTargetByTag "TAG" "!REQUEST_COOKIES" to exclude all cookies
+			if (ex.KeyStr == "" && ex.KeyRx == nil) ||
+				(ex.KeyRx != nil && ex.KeyRx.MatchString(lkey)) ||
+				strings.ToLower(ex.KeyStr) == lkey {
 				isException = true
 				break
 			}
